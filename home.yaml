@@ -1,0 +1,47 @@
+esphome:
+  name: power-monitor
+  platform: ESP32
+  board: esp32dev
+
+wifi:
+  ssid: "YourSSID"
+  password: "YourPassword"
+
+api:          # enables Home Assistant integration
+ota:          # enables over-the-air updates
+logger:
+
+uart:
+  id: pzem_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+
+sensor:
+  - platform: pzemac   # PZEM-004T AC version
+    uart_id: pzem_uart
+    current:
+      name: "Current"
+    voltage:
+      name: "Voltage"
+    power:
+      name: "Active Power"
+    energy:
+      name: "Energy"
+    frequency:
+      name: "Frequency"
+    power_factor:
+      name: "Power Factor"
+    update_interval: 5s
+
+  # Derived: Q factor (reactive power in VAR)
+  - platform: template
+    name: "Reactive Power Q"
+    unit_of_measurement: "VAR"
+    lambda: |-
+      float pf = id(power_factor_sensor).state;
+      float p  = id(active_power_sensor).state;
+      if (pf >= 1.0 || pf <= 0.0) return 0.0;
+      float angle = acos(pf);
+      return p * tan(angle);
+    update_interval: 5s
