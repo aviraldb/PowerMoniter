@@ -117,13 +117,13 @@ PowerData latest = {0};
 // ─────────────────────────────────────────────────────────────
 //  State
 // ─────────────────────────────────────────────────────────────
-enum WiFiMode_t { WIFI_STA_OK, WIFI_AP_MODE, WIFI_NONE };
+enum NetMode_t { NET_STA_OK, NET_AP_MODE, NET_NONE };
 
 PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
 WebServer    server(80);
 
 bool         sdAvailable   = false;
-WiFiMode_t   netMode       = WIFI_NONE;
+NetMode_t    netMode       = NET_NONE;
 uint32_t     lastReadMs    = 0;
 uint32_t     lastLogMs     = 0;
 uint32_t     lastWifiMs    = 0;
@@ -137,8 +137,14 @@ uint8_t      pzemFailCount = 0;
 // ─────────────────────────────────────────────────────────────
 
 void initWatchdog() {
-    esp_task_wdt_init(WDT_TIMEOUT_S, true);   // panic=true → reboot on timeout
-    esp_task_wdt_add(NULL);                    // watch main task
+    // ESP32 Arduino core 3.x changed esp_task_wdt_init() to take a config struct
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms     = (uint32_t)(WDT_TIMEOUT_S) * 1000U,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    esp_task_wdt_reconfigure(&wdt_cfg);   // safe whether WDT already running or not
+    esp_task_wdt_add(NULL);               // watch the main (Arduino) task
     Serial.println("[WDT] Hardware watchdog armed (" + String(WDT_TIMEOUT_S) + "s)");
 }
 
@@ -352,7 +358,7 @@ void logToSD() {
 void startAP() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
-    netMode = WIFI_AP_MODE;
+    netMode = NET_AP_MODE;
     Serial.printf("[WiFi] AP mode started — connect to '%s'\n", AP_SSID);
     Serial.printf("[WiFi] AP IP: http://%s\n", WiFi.softAPIP().toString().c_str());
 }
@@ -372,7 +378,7 @@ void setupWiFi() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        netMode = WIFI_STA_OK;
+        netMode = NET_STA_OK;
         Serial.printf("\n[WiFi] Connected! IP: http://%s\n",
                       WiFi.localIP().toString().c_str());
         configTime(GMT_OFFSET_S, DAYLIGHT_S, NTP_SERVER);
@@ -385,7 +391,7 @@ void setupWiFi() {
 
 // Periodic WiFi health check — reconnect if dropped
 void checkWiFi() {
-    if (netMode == WIFI_AP_MODE) return;    // AP doesn't drop
+    if (netMode == NET_AP_MODE) return;    // AP doesn't drop
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[WiFi] Connection lost — reconnecting...");
         WiFi.disconnect();
@@ -421,7 +427,7 @@ bool isAuthenticated() {
 // ─────────────────────────────────────────────────────────────
 
 // Stored in flash, not RAM
-static const char HTML_HEAD[] PROGMEM = R"(<!DOCTYPE html>
+static const char HTML_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -471,9 +477,9 @@ button:hover{background:#334155}
 <button onclick="fetch('/reset').then(r=>r.text()).then(t=>alert(t))">Reset Energy Counter</button>
 </div>
 <div id="ts">Updating...</div>
-)";
+)HTML";
 
-static const char HTML_SCRIPT[] PROGMEM = R"(<script>
+static const char HTML_SCRIPT[] PROGMEM = R"HTML(<script>
 async function update(){
   try{
     const r=await fetch('/data');
@@ -509,7 +515,7 @@ async function update(){
   }
 }
 update();setInterval(update,3000);
-</script></body></html>)";
+</script></body></html>)HTML";
 
 // Chunked response — streams HTML in pieces, no single large alloc
 void handleRoot() {
@@ -529,8 +535,8 @@ void handleJson() {
         server.send(503, "application/json", "{\"error\":\"No sensor data\"}");
         return;
     }
-    const char* nm = (netMode == WIFI_STA_OK) ? "STA"
-                   : (netMode == WIFI_AP_MODE) ? "AP" : "NONE";
+    const char* nm = (netMode == NET_STA_OK) ? "STA"
+                   : (netMode == NET_AP_MODE) ? "AP" : "NONE";
     char buf[320];
     snprintf(buf, sizeof(buf),
         "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.2f,"
