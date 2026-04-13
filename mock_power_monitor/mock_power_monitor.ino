@@ -12,11 +12,8 @@
  *    - esp_task_wdt.h           — built into ESP32 Arduino core
  *
  *  SECURITY NOTE:
- *    This device is designed for LAN use only — do NOT expose
- *    the web server to the public internet. HTTP (not HTTPS) is
- *    used; traffic is visible on the local network.
- *    The dashboard has no login — anyone on the network can view it.
- * ============================================================
+ *    Designed for LAN use only — do NOT expose to the internet.
+ *    HTTP only (no HTTPS); no login on the dashboard.
  *
  *  WIRING:
  *  ┌─────────────┬──────────┬──────────────────────────────┐
@@ -31,20 +28,6 @@
  *  │ SD MISO     │ GPIO19   │                              │
  *  │ SD VCC      │ 3.3V     │                              │
  *  └─────────────┴──────────┴──────────────────────────────┘
- *
- *  SERIAL MONITOR COMMANDS (115200 baud):
- *    help      — list all commands
- *    status    — full system status dump
- *    sensor    — force immediate PZEM read
- *    buf       — dump ring buffer contents
- *    wifiscan  — scan nearby WiFi networks
- *    wifiinfo  — current WiFi connection details
- *    sdinfo    — SD card info and file size
- *    ntpresync — force NTP re-sync
- *    mem       — heap / stack memory report
- *    reset     — reset PZEM energy counter
- *    reboot    — soft reboot ESP32
- *    loglevel  — toggle verbose logging on/off
  * ============================================================
  */
 
@@ -59,23 +42,24 @@
 #include <math.h>
 #include <esp_task_wdt.h>
 
+// Generic value defination 
+#define GENERIC_PZEM
+
 // ─── WiFi Config ─────────────────────────────────────────────
-// WARNING: Hardcoded credentials — LAN use only, do not expose
-// to the internet.
-const char* WIFI_SSID      = "aviraldubey";
-const char* WIFI_PASSWORD  = "hotspot7";
+const char* WIFI_SSID     = "aviraldubey";
+const char* WIFI_PASSWORD = "hotspot7";
 
 // AP fallback — used when STA connection fails
-const char* AP_SSID        = "PowerMonitor-AP";
-const char* AP_PASS        = "esp32power";     // min 8 chars
+const char* AP_SSID       = "PowerMonitor-AP";
+const char* AP_PASS       = "esp32power";
 
 // mDNS hostname — accessible as http://powermonitor.local
-const char* MDNS_HOST      = "powermonitor";
+const char* MDNS_HOST     = "powermonitor";
 
 // ─── NTP ─────────────────────────────────────────────────────
-const char* NTP_SERVER     = "pool.ntp.org";
-const long  GMT_OFFSET_S   = 19800;    // UTC+5:30 India
-const int   DAYLIGHT_S     = 0;
+const char* NTP_SERVER    = "pool.ntp.org";
+const long  GMT_OFFSET_S  = 19800;    // UTC+5:30 India
+const int   DAYLIGHT_S    = 0;
 
 // ─── Pin Definitions ─────────────────────────────────────────
 #define PZEM_RX_PIN     16
@@ -85,21 +69,25 @@ const int   DAYLIGHT_S     = 0;
 // ─── Timing ──────────────────────────────────────────────────
 #define READ_INTERVAL_MS      5000     // sensor read period
 #define LOG_INTERVAL_MS     300000     // SD log period (5 min)
-#define WIFI_CHECK_MS        30000     // WiFi health check period
+#define WIFI_CHECK_MS        30000     // WiFi health check
 #define SD_RETRY_MS          15000     // retry failed SD init
-#define NTP_RESYNC_MS      3600000     // NTP re-sync every 1 hour
-#define WDT_TIMEOUT_S          120     // watchdog timeout (seconds)
-#define CMD_BUF_SIZE            64     // serial command buffer size
+#define NTP_RESYNC_MS      3600000     // NTP re-sync every 1 hr
+#define WDT_TIMEOUT_S          120     // watchdog timeout (s)
+
+// ─── Mock / Demo Mode ────────────────────────────────────────
+// Uncomment to bypass the real PZEM and use simulated values.
+// Comment out once PZEM hardware is confirmed working.
+//#define GENERIC_PZEM
 
 // ─── Data Validation Limits (India 230V grid) ────────────────
-#define V_MIN    170.0f    // V
-#define V_MAX    270.0f    // V
-#define I_MIN      0.0f    // A
-#define I_MAX    100.0f    // A
-#define P_MIN      0.0f    // W
-#define P_MAX  23000.0f    // W
-#define F_MIN     45.0f    // Hz
-#define F_MAX     55.0f    // Hz
+#define V_MIN    170.0f
+#define V_MAX    270.0f
+#define I_MIN      0.0f
+#define I_MAX    100.0f
+#define P_MIN      0.0f
+#define P_MAX  23000.0f
+#define F_MIN     45.0f
+#define F_MAX     55.0f
 #define PF_MIN     0.0f
 #define PF_MAX     1.0f
 
@@ -108,16 +96,9 @@ const int   DAYLIGHT_S     = 0;
 
 // ─── SD ──────────────────────────────────────────────────────
 #define LOG_FILENAME   "/log_file.csv"
-#define SD_FLUSH_N      5             // flush every N writes
+#define SD_FLUSH_N      5
 
-// ─────────────────────────────────────────────────────────────
-//  Debug / Logging
-// ─────────────────────────────────────────────────────────────
-
-bool verboseLog = false;    // toggled via serial command
-
-// Verbose-only print — compile-time zero-cost when disabled at runtime
-#define VLOG(fmt, ...) do { if (verboseLog) Serial.printf("[VERB] " fmt "\n", ##__VA_ARGS__); } while(0)
+// ─── Logging ─────────────────────────────────────────────────
 #define LOG(fmt, ...)  Serial.printf(fmt "\n", ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────
@@ -138,11 +119,10 @@ struct PowerData {
     uint32_t timestamp;
 };
 
-// Ring buffer — written every READ_INTERVAL, flushed to SD on log/retry
 struct RingBuffer {
     PowerData entries[BUFFER_SIZE];
-    uint8_t   head;     // next write index
-    uint8_t   count;    // how many valid entries
+    uint8_t   head;
+    uint8_t   count;
 } ringBuf = {{}, 0, 0};
 
 PowerData latest = {0};
@@ -150,6 +130,7 @@ PowerData latest = {0};
 // ─────────────────────────────────────────────────────────────
 //  State
 // ─────────────────────────────────────────────────────────────
+
 enum NetMode_t { NET_STA_OK, NET_AP_MODE, NET_NONE };
 
 PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN, 0x01);
@@ -167,13 +148,8 @@ uint8_t      pzemFailCount  = 0;
 uint32_t     totalReadCount = 0;
 uint32_t     totalFailCount = 0;
 bool         ntpSynced      = false;
-uint32_t     bootTime       = 0;
 
-// Serial command buffer
-char         cmdBuf[CMD_BUF_SIZE];
-uint8_t      cmdLen = 0;
-
-#define PZEM_FAIL_REBOOT  10   // reboot after this many consecutive fails
+#define PZEM_FAIL_REBOOT  10
 
 // ─────────────────────────────────────────────────────────────
 //  Watchdog
@@ -187,12 +163,10 @@ void initWatchdog() {
     };
     esp_task_wdt_reconfigure(&wdt_cfg);
     esp_task_wdt_add(NULL);
-    LOG("[WDT] Hardware watchdog armed (%ds)", WDT_TIMEOUT_S);
+    LOG("[WDT] Watchdog armed (%ds)", WDT_TIMEOUT_S);
 }
 
-inline void feedWatchdog() {
-    esp_task_wdt_reset();
-}
+inline void feedWatchdog() { esp_task_wdt_reset(); }
 
 // ─────────────────────────────────────────────────────────────
 //  Helpers
@@ -200,10 +174,7 @@ inline void feedWatchdog() {
 
 void getTimestamp(char* buf, size_t len) {
     struct tm ti;
-    if (!getLocalTime(&ti)) {
-        snprintf(buf, len, "NO_TIME");
-        return;
-    }
+    if (!getLocalTime(&ti)) { snprintf(buf, len, "NO_TIME"); return; }
     strftime(buf, len, "%Y-%m-%d %H:%M:%S", &ti);
 }
 
@@ -219,22 +190,15 @@ void pushBuffer(const PowerData& d) {
     ringBuf.entries[ringBuf.head] = d;
     ringBuf.head = (ringBuf.head + 1) % BUFFER_SIZE;
     if (ringBuf.count < BUFFER_SIZE) ringBuf.count++;
-    VLOG("Ring buffer push — head=%u count=%u", ringBuf.head, ringBuf.count);
 }
 
 // ─────────────────────────────────────────────────────────────
-//  NTP — with periodic re-sync
+//  NTP
 // ─────────────────────────────────────────────────────────────
 
 void syncNTP() {
-    if (netMode != NET_STA_OK) {
-        LOG("[NTP] Skipping sync — not in STA mode");
-        return;
-    }
-    LOG("[NTP] Requesting time sync from %s", NTP_SERVER);
+    if (netMode != NET_STA_OK) return;
     configTime(GMT_OFFSET_S, DAYLIGHT_S, NTP_SERVER);
-
-    // Wait up to 5s for sync
     struct tm ti;
     uint32_t t0 = millis();
     while (!getLocalTime(&ti) && millis() - t0 < 5000) {
@@ -247,15 +211,59 @@ void syncNTP() {
         LOG("[NTP] Synced — %s", ts);
         ntpSynced = true;
     } else {
-        LOG("[NTP] Sync timed out — timestamps will show NO_TIME");
+        LOG("[NTP] Sync timed out");
         ntpSynced = false;
     }
     lastNtpMs = millis();
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Sensor Reading with Validation + Retry
+//  Sensor Reading
 // ─────────────────────────────────────────────────────────────
+
+#ifdef GENERIC_PZEM
+
+static float _mock_energy = 1.234f;
+
+static float mockVal(float base, float range) {
+    uint32_t t    = millis() / 1000;
+    float    phi  = (float)(t % 60) / 60.0f;
+    float    wave = (phi < 0.5f) ? (phi * 2.0f) : (2.0f - phi * 2.0f);
+    return base - range + wave * 2.0f * range;
+}
+
+void readSensor() {
+    totalReadCount++;
+    PowerData d;
+    d.timestamp = millis();
+    d.voltage   = mockVal(220.0f,  4.0f);
+    d.current   = mockVal(  2.36f, 0.15f);
+    d.power     = mockVal(480.0f, 20.0f);
+    d.frequency = mockVal( 49.9f,  0.15f);
+    d.pf        = mockVal(  0.92f, 0.03f);
+    _mock_energy += (d.power / 1000.0f) * ((float)READ_INTERVAL_MS / 3600000.0f);
+    d.energy = _mock_energy;
+    d.valid  = true;
+    computeDerived(d);
+    latest = d;
+    pushBuffer(d);
+
+    char ts[32]; getTimestamp(ts, sizeof(ts));
+    Serial.println(F("──────────────────────────────────"));
+    Serial.printf("  Time        : %s\n", ts);
+    Serial.printf("  Voltage     : %7.2f V\n",   d.voltage);
+    Serial.printf("  Current     : %7.3f A\n",   d.current);
+    Serial.printf("  Active P    : %7.2f W\n",   d.power);
+    Serial.printf("  Apparent S  : %7.2f VA\n",  d.apparent);
+    Serial.printf("  Reactive Q  : %7.2f VAR\n", d.reactive);
+    Serial.printf("  Q Factor    : %7.4f\n",      d.qFactor);
+    Serial.printf("  Power Factor: %7.3f\n",      d.pf);
+    Serial.printf("  Frequency   : %7.2f Hz\n",  d.frequency);
+    Serial.printf("  Energy      : %7.3f kWh\n", d.energy);
+    Serial.println(F("──────────────────────────────────"));
+}
+
+#else  // real PZEM
 
 bool readOnce(PowerData& d) {
     d.timestamp = millis();
@@ -266,31 +274,23 @@ bool readOnce(PowerData& d) {
     d.frequency = pzem.frequency();
     d.pf        = pzem.pf();
 
-    VLOG("Raw PZEM — V=%.2f I=%.3f P=%.2f E=%.3f F=%.2f PF=%.3f",
-         d.voltage, d.current, d.power, d.energy, d.frequency, d.pf);
-
-    // NaN check
     if (isnan(d.voltage) || isnan(d.current) || isnan(d.power) ||
         isnan(d.energy)  || isnan(d.frequency)|| isnan(d.pf)) {
-        LOG("[VAL] NaN detected in PZEM reading");
+        LOG("[PZEM] NaN in reading");
         return false;
     }
-
-    // Range validation
-    if (d.voltage   < V_MIN  || d.voltage   > V_MAX)  { LOG("[VAL] Voltage out of range: %.2f",   d.voltage);   return false; }
-    if (d.current   < I_MIN  || d.current   > I_MAX)  { LOG("[VAL] Current out of range: %.3f",   d.current);   return false; }
-    if (d.power     < P_MIN  || d.power     > P_MAX)  { LOG("[VAL] Power out of range: %.2f",     d.power);     return false; }
-    if (d.frequency < F_MIN  || d.frequency > F_MAX)  { LOG("[VAL] Frequency out of range: %.2f", d.frequency); return false; }
-    if (d.pf        < PF_MIN || d.pf        > PF_MAX) { LOG("[VAL] PF out of range: %.3f",        d.pf);        return false; }
-
+    if (d.voltage   < V_MIN  || d.voltage   > V_MAX)  { LOG("[PZEM] Voltage out of range: %.2f",   d.voltage);   return false; }
+    if (d.current   < I_MIN  || d.current   > I_MAX)  { LOG("[PZEM] Current out of range: %.3f",   d.current);   return false; }
+    if (d.power     < P_MIN  || d.power     > P_MAX)  { LOG("[PZEM] Power out of range: %.2f",     d.power);     return false; }
+    if (d.frequency < F_MIN  || d.frequency > F_MAX)  { LOG("[PZEM] Frequency out of range: %.2f", d.frequency); return false; }
+    if (d.pf        < PF_MIN || d.pf        > PF_MAX) { LOG("[PZEM] PF out of range: %.3f",        d.pf);        return false; }
     return true;
 }
 
 void readSensor() {
     PowerData d;
-    bool      ok = false;
-
-    uint32_t readStart = millis();
+    bool      ok        = false;
+    uint32_t  readStart = millis();
 
     for (uint8_t attempt = 1; attempt <= 3; attempt++) {
         ok = readOnce(d);
@@ -308,10 +308,9 @@ void readSensor() {
         latest.valid = false;
         LOG("[PZEM] Read failed (consecutive: %u  total: %lu  took: %lums)",
             pzemFailCount, totalFailCount, readMs);
-
         if (pzemFailCount >= PZEM_FAIL_REBOOT) {
             LOG("[PZEM] %u consecutive failures — rebooting", PZEM_FAIL_REBOOT);
-            SD.end();    // flush SD before restart
+            SD.end();
             delay(200);
             ESP.restart();
         }
@@ -322,10 +321,8 @@ void readSensor() {
     d.valid = true;
     computeDerived(d);
     latest = d;
-
     pushBuffer(d);
 
-    // ── Serial readout ────────────────────────────────────────
     char ts[32]; getTimestamp(ts, sizeof(ts));
     Serial.println(F("──────────────────────────────────"));
     Serial.printf("  Time        : %s\n", ts);
@@ -339,10 +336,12 @@ void readSensor() {
     Serial.printf("  Frequency   : %7.2f Hz\n",  d.frequency);
     Serial.printf("  Energy      : %7.3f kWh\n", d.energy);
     Serial.printf("  Read time   : %lu ms\n",     readMs);
-    Serial.printf("  Reads OK/Total: %lu/%lu\n",
+    Serial.printf("  OK/Total    : %lu/%lu\n",
         totalReadCount - totalFailCount, totalReadCount);
     Serial.println(F("──────────────────────────────────"));
 }
+
+#endif  // GENERIC_PZEM
 
 // ─────────────────────────────────────────────────────────────
 //  SD Card
@@ -357,12 +356,12 @@ void initSD() {
     }
     sdAvailable = true;
 
-    uint8_t  cardType = SD.cardType();
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-    const char* typeStr = (cardType == CARD_MMC)  ? "MMC"  :
-                          (cardType == CARD_SD)   ? "SDSC" :
-                          (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
-    LOG("[SD] Mounted OK — type: %s  size: %lluMB", typeStr, cardSize);
+    uint8_t     cardType = SD.cardType();
+    uint64_t    cardSize = SD.cardSize() / (1024 * 1024);
+    const char* typeStr  = (cardType == CARD_MMC)  ? "MMC"  :
+                           (cardType == CARD_SD)   ? "SDSC" :
+                           (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
+    LOG("[SD] Mounted — type: %s  size: %lluMB", typeStr, cardSize);
 
     if (!SD.exists(LOG_FILENAME)) {
         File f = SD.open(LOG_FILENAME, FILE_WRITE);
@@ -374,10 +373,9 @@ void initSD() {
             LOG("[SD] Log file created: %s", LOG_FILENAME);
         }
     } else {
-        // Report existing file size
         File f = SD.open(LOG_FILENAME, FILE_READ);
         if (f) {
-            LOG("[SD] Log file exists — size: %lu bytes  rows ~%lu",
+            LOG("[SD] Log file exists — %lu bytes  ~%lu rows",
                 (unsigned long)f.size(), (unsigned long)(f.size() / 80));
             f.close();
         }
@@ -400,7 +398,6 @@ bool writeRow(File& f, const PowerData& d) {
 void logToSD() {
     if (!latest.valid) return;
 
-    // Attempt SD re-init if unavailable
     if (!sdAvailable) {
         uint32_t now = millis();
         if (now - lastSdRetryMs >= SD_RETRY_MS) {
@@ -409,43 +406,38 @@ void logToSD() {
             initSD();
         }
         if (!sdAvailable) {
-            LOG("[SD] Still unavailable — %u readings held in RAM buffer", ringBuf.count);
+            LOG("[SD] Unavailable — %u readings in RAM buffer", ringBuf.count);
             return;
         }
     }
 
     File f = SD.open(LOG_FILENAME, FILE_APPEND);
     if (!f) {
-        LOG("[SD] Open for append failed — marking unavailable");
+        LOG("[SD] Open failed — marking unavailable");
         sdAvailable = false;
         return;
     }
 
-    // Flush buffered rows held during SD outage
     uint8_t flushed = 0;
     if (ringBuf.count > 1) {
-        uint8_t oldest = (ringBuf.head + BUFFER_SIZE - ringBuf.count) % BUFFER_SIZE;
-        uint8_t toFlush = ringBuf.count - 1;    // -1: latest written below
+        uint8_t oldest  = (ringBuf.head + BUFFER_SIZE - ringBuf.count) % BUFFER_SIZE;
+        uint8_t toFlush = ringBuf.count - 1;
         for (uint8_t i = 0; i < toFlush; i++) {
-            uint8_t idx = (oldest + i) % BUFFER_SIZE;
-            writeRow(f, ringBuf.entries[idx]);
+            writeRow(f, ringBuf.entries[(oldest + i) % BUFFER_SIZE]);
             flushed++;
         }
-        ringBuf.count = 1;    // retain only latest
-        // FIX: use saved 'flushed' count, not the already-reset ringBuf.count
-        LOG("[SD] Flushed %u buffered rows from RAM", flushed);
+        ringBuf.count = 1;
+        LOG("[SD] Flushed %u buffered rows", flushed);
     }
 
     bool ok = writeRow(f, latest);
     logWriteCount++;
-
     if (logWriteCount % SD_FLUSH_N == 0) f.flush();
     f.close();
 
     if (ok) {
         char ts[32]; getTimestamp(ts, sizeof(ts));
-        LOG("[SD] Row #%lu logged at %s  (file rows ~%lu)",
-            logWriteCount, ts, logWriteCount);
+        LOG("[SD] Row #%lu logged at %s", logWriteCount, ts);
     } else {
         LOG("[SD] Write error — marking unavailable");
         sdAvailable = false;
@@ -480,21 +472,15 @@ void setupWiFi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         netMode = NET_STA_OK;
-        LOG("[WiFi] Connected — IP: http://%s", WiFi.localIP().toString().c_str());
-        LOG("[WiFi] RSSI: %d dBm  Channel: %d",
-            WiFi.RSSI(), WiFi.channel());
-
-        // mDNS
+        LOG("[WiFi] Connected — IP: http://%s  RSSI: %d dBm",
+            WiFi.localIP().toString().c_str(), WiFi.RSSI());
         if (MDNS.begin(MDNS_HOST)) {
             MDNS.addService("http", "tcp", 80);
-            LOG("[mDNS] Reachable at http://%s.local", MDNS_HOST);
-        } else {
-            LOG("[mDNS] Failed to start");
+            LOG("[mDNS] http://%s.local", MDNS_HOST);
         }
-
         syncNTP();
     } else {
-        LOG("[WiFi] STA failed — starting AP fallback");
+        LOG("[WiFi] STA failed — starting AP");
         startAP();
     }
 }
@@ -502,7 +488,7 @@ void setupWiFi() {
 void checkWiFi() {
     if (netMode == NET_AP_MODE) return;
     if (WiFi.status() != WL_CONNECTED) {
-        LOG("[WiFi] Connection lost (RSSI was %d dBm) — reconnecting...", WiFi.RSSI());
+        LOG("[WiFi] Lost connection — reconnecting...");
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         uint32_t t0 = millis();
@@ -512,15 +498,11 @@ void checkWiFi() {
         }
         if (WiFi.status() == WL_CONNECTED) {
             netMode = NET_STA_OK;
-            LOG("[WiFi] Reconnected — IP: %s  RSSI: %d dBm",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            LOG("[WiFi] Reconnected — IP: %s", WiFi.localIP().toString().c_str());
         } else {
-            LOG("[WiFi] Reconnect failed — switching to AP mode");
+            LOG("[WiFi] Reconnect failed — switching to AP");
             startAP();
         }
-    } else {
-        VLOG("WiFi OK — RSSI: %d dBm  IP: %s", WiFi.RSSI(),
-             WiFi.localIP().toString().c_str());
     }
 }
 
@@ -549,12 +531,14 @@ h1{text-align:center;font-size:1.4rem;font-weight:600;color:#38bdf8;margin:16px 
 #ts{text-align:center;font-size:11px;color:#475569;margin-top:8px}
 .banner{display:none;max-width:720px;margin:0 auto 16px;border-radius:8px;padding:10px;text-align:center;font-size:13px}
 .banner.err{background:#7f1d1d;color:#fca5a5}.banner.warn{background:#78350f;color:#fcd34d}
+.banner.mock{background:#1e3a5f;color:#7dd3fc;border:1px solid #3b82f6}
 .btns{text-align:center;margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
 button{padding:6px 18px;border-radius:6px;border:1px solid #334155;background:#1e293b;color:#94a3b8;cursor:pointer;font-size:12px}
 button:hover{background:#334155}
 </style></head><body>
 <h1>&#9889; ESP32 Power Monitor</h1>
 <div class="banner err" id="err">Sensor read error &mdash; check PZEM wiring</div>
+<div class="banner mock" id="mock-banner" style="display:none">&#128268; SIMULATED DATA &mdash; GENERIC_PZEM mode active</div>
 <div class="banner warn" id="warn"></div>
 <div class="grid">
 <div class="card"><div class="label">Voltage</div><div class="value" id="v">&#8212;</div><div class="unit">V</div></div>
@@ -619,6 +603,7 @@ async function update(){
     const w=E('warn');
     if(d.fails>3){w.style.display='block';w.textContent='PZEM failures: '+d.fails+' consecutive';}
     else w.style.display='none';
+    E('mock-banner').style.display=d.mock?'block':'none';
     E('ts').textContent='Last update: '+new Date().toLocaleTimeString();
   }catch(e){
     document.getElementById('ts').textContent='Connection error: '+e.message;
@@ -635,15 +620,14 @@ void handleRoot() {
     server.client().flush();
 }
 
-// JSON data endpoint
 void handleJson() {
     if (!latest.valid) {
         server.send(503, "application/json", "{\"error\":\"No sensor data\"}");
         return;
     }
-    const char* nm = (netMode == NET_STA_OK) ? "STA"
-                   : (netMode == NET_AP_MODE) ? "AP" : "NONE";
-    int rssi = (netMode == NET_STA_OK) ? WiFi.RSSI() : 0;
+    const char* nm   = (netMode == NET_STA_OK) ? "STA"
+                     : (netMode == NET_AP_MODE) ? "AP" : "NONE";
+    int         rssi = (netMode == NET_STA_OK) ? WiFi.RSSI() : 0;
 
     char buf[400];
     snprintf(buf, sizeof(buf),
@@ -652,7 +636,7 @@ void handleJson() {
         "\"pf\":%.3f,\"frequency\":%.2f,\"energy\":%.3f,"
         "\"uptime\":%lu,\"sd\":%s,\"logs\":%lu,"
         "\"buf\":%u,\"fails\":%u,\"totalfails\":%lu,"
-        "\"rssi\":%d,\"ntp\":%s,\"netmode\":\"%s\"}",
+        "\"rssi\":%d,\"ntp\":%s,\"netmode\":\"%s\",\"mock\":%s}",
         latest.voltage, latest.current, latest.power,
         latest.apparent, latest.reactive, latest.qFactor,
         latest.pf, latest.frequency, latest.energy,
@@ -664,11 +648,16 @@ void handleJson() {
         totalFailCount,
         rssi,
         ntpSynced ? "true" : "false",
-        nm);
+        nm,
+#ifdef GENERIC_PZEM
+        "true"
+#else
+        "false"
+#endif
+    );
     server.send(200, "application/json", buf);
 }
 
-// CSV download endpoint — streams SD log file to browser
 void handleExport() {
     if (!sdAvailable) {
         server.send(503, "text/plain", "SD card unavailable");
@@ -682,20 +671,22 @@ void handleExport() {
     server.sendHeader("Content-Disposition", "attachment; filename=\"powerlog.csv\"");
     server.setContentLength(f.size());
     server.send(200, "text/csv", "");
-
     uint8_t chunk[512];
     while (f.available()) {
         size_t n = f.read(chunk, sizeof(chunk));
         server.client().write(chunk, n);
     }
     f.close();
-    LOG("[HTTP] CSV exported (%lu bytes)", (unsigned long)f.size());
 }
 
 void handleResetEnergy() {
+#ifdef GENERIC_PZEM
+    server.send(200, "text/plain", "Reset not available in simulation mode");
+#else
     bool ok = pzem.resetEnergy();
     server.send(200, "text/plain", ok ? "Energy counter reset OK" : "Reset failed");
     LOG("[PZEM] Energy reset %s", ok ? "OK" : "FAILED");
+#endif
 }
 
 void startWebServer() {
@@ -703,261 +694,9 @@ void startWebServer() {
     server.on("/data",   handleJson);
     server.on("/reset",  handleResetEnergy);
     server.on("/export", handleExport);
-    server.onNotFound([]() {
-        server.send(404, "text/plain", "Not found");
-    });
+    server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
     server.begin();
     LOG("[HTTP] Web server started on port 80");
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Serial Debug Commands
-// ─────────────────────────────────────────────────────────────
-
-void printHelp() {
-    Serial.println(F("\n╔═══════════════════════════════════╗"));
-    Serial.println(F("║   ESP32 Power Monitor — Commands  ║"));
-    Serial.println(F("╠═══════════════════════════════════╣"));
-    Serial.println(F("║  help      list commands           ║"));
-    Serial.println(F("║  status    full system status      ║"));
-    Serial.println(F("║  sensor    force PZEM read now     ║"));
-    Serial.println(F("║  buf       dump ring buffer        ║"));
-    Serial.println(F("║  wifiscan  scan nearby networks    ║"));
-    Serial.println(F("║  wifiinfo  WiFi connection details ║"));
-    Serial.println(F("║  sdinfo    SD card info + file size║"));
-    Serial.println(F("║  ntpresync force NTP re-sync       ║"));
-    Serial.println(F("║  mem       heap memory report      ║"));
-    Serial.println(F("║  reset     reset PZEM energy       ║"));
-    Serial.println(F("║  reboot    soft reboot ESP32       ║"));
-    Serial.println(F("║  loglevel  toggle verbose logging  ║"));
-    Serial.println(F("╚═══════════════════════════════════╝\n"));
-}
-
-void cmdStatus() {
-    char ts[32]; getTimestamp(ts, sizeof(ts));
-    uint32_t upSec = millis() / 1000;
-
-    Serial.println(F("\n=== SYSTEM STATUS ==="));
-    Serial.printf("  Firmware     : ESP32 Power Monitor\n");
-    Serial.printf("  Time         : %s  (NTP: %s)\n",
-        ts, ntpSynced ? "synced" : "NOT synced");
-    Serial.printf("  Uptime       : %lus (%luh %lum %lus)\n",
-        upSec, upSec/3600, (upSec%3600)/60, upSec%60);
-
-    Serial.println(F("\n--- SENSOR ---"));
-    if (latest.valid) {
-        Serial.printf("  Voltage      : %.2f V\n",   latest.voltage);
-        Serial.printf("  Current      : %.3f A\n",   latest.current);
-        Serial.printf("  Active P     : %.2f W\n",   latest.power);
-        Serial.printf("  Apparent S   : %.2f VA\n",  latest.apparent);
-        Serial.printf("  Reactive Q   : %.2f VAR\n", latest.reactive);
-        Serial.printf("  Q Factor     : %.4f\n",     latest.qFactor);
-        Serial.printf("  Power Factor : %.3f\n",     latest.pf);
-        Serial.printf("  Frequency    : %.2f Hz\n",  latest.frequency);
-        Serial.printf("  Energy       : %.3f kWh\n", latest.energy);
-    } else {
-        Serial.println("  No valid reading yet");
-    }
-    Serial.printf("  Consec. fails: %u / %lu total (reboot at %u)\n",
-        pzemFailCount, totalFailCount, PZEM_FAIL_REBOOT);
-    Serial.printf("  Total reads  : %lu  success: %lu  fail: %lu\n",
-        totalReadCount, totalReadCount - totalFailCount, totalFailCount);
-
-    Serial.println(F("\n--- SD ---"));
-    Serial.printf("  Available    : %s\n", sdAvailable ? "YES" : "NO");
-    Serial.printf("  Log rows     : %lu\n", logWriteCount);
-    Serial.printf("  Buffer entries: %u / %u\n", ringBuf.count, BUFFER_SIZE);
-    if (sdAvailable) {
-        File f = SD.open(LOG_FILENAME, FILE_READ);
-        if (f) { Serial.printf("  File size    : %lu bytes\n", (unsigned long)f.size()); f.close(); }
-    }
-
-    Serial.println(F("\n--- NETWORK ---"));
-    const char* modeStr = (netMode == NET_STA_OK) ? "STA (connected)" :
-                          (netMode == NET_AP_MODE) ? "AP (fallback)"  : "None";
-    Serial.printf("  Mode         : %s\n", modeStr);
-    if (netMode == NET_STA_OK) {
-        Serial.printf("  SSID         : %s\n", WiFi.SSID().c_str());
-        Serial.printf("  IP           : %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("  Gateway      : %s\n", WiFi.gatewayIP().toString().c_str());
-        Serial.printf("  RSSI         : %d dBm\n", WiFi.RSSI());
-        Serial.printf("  Channel      : %d\n", WiFi.channel());
-        Serial.printf("  MAC          : %s\n", WiFi.macAddress().c_str());
-        Serial.printf("  mDNS         : http://%s.local\n", MDNS_HOST);
-    } else if (netMode == NET_AP_MODE) {
-        Serial.printf("  AP SSID      : %s\n", AP_SSID);
-        Serial.printf("  AP IP        : %s\n", WiFi.softAPIP().toString().c_str());
-        Serial.printf("  Clients      : %d\n", WiFi.softAPgetStationNum());
-    }
-
-    Serial.println(F("\n--- MEMORY ---"));
-    Serial.printf("  Free heap    : %lu bytes\n", (unsigned long)ESP.getFreeHeap());
-    Serial.printf("  Min free heap: %lu bytes\n", (unsigned long)ESP.getMinFreeHeap());
-    Serial.printf("  Heap size    : %lu bytes\n", (unsigned long)ESP.getHeapSize());
-    Serial.printf("  PSRAM        : %s\n", psramFound() ? "Found" : "None");
-    Serial.printf("  Flash size   : %lu bytes\n", (unsigned long)ESP.getFlashChipSize());
-    Serial.printf("  CPU freq     : %u MHz\n", ESP.getCpuFreqMHz());
-
-    Serial.println(F("\n--- CONFIG ---"));
-    Serial.printf("  Read interval : %ds\n", READ_INTERVAL_MS / 1000);
-    Serial.printf("  Log interval  : %ds\n", LOG_INTERVAL_MS / 1000);
-    Serial.printf("  WDT timeout   : %ds\n", WDT_TIMEOUT_S);
-    Serial.printf("  Verbose log   : %s\n", verboseLog ? "ON" : "OFF");
-    Serial.println(F("====================\n"));
-}
-
-void cmdDumpBuffer() {
-    Serial.printf("\n=== RING BUFFER (%u/%u entries) ===\n", ringBuf.count, BUFFER_SIZE);
-    if (ringBuf.count == 0) { Serial.println("  (empty)"); return; }
-    uint8_t oldest = (ringBuf.head + BUFFER_SIZE - ringBuf.count) % BUFFER_SIZE;
-    for (uint8_t i = 0; i < ringBuf.count; i++) {
-        uint8_t idx = (oldest + i) % BUFFER_SIZE;
-        const PowerData& d = ringBuf.entries[idx];
-        Serial.printf("  [%2u] t=%lus  V=%.1f  I=%.3f  P=%.1fW  PF=%.3f  %s\n",
-            i, d.timestamp / 1000,
-            d.voltage, d.current, d.power, d.pf,
-            d.valid ? "OK" : "INVALID");
-    }
-    Serial.println();
-}
-
-void cmdWifiScan() {
-    LOG("[WiFi] Scanning...");
-    int n = WiFi.scanNetworks();
-    if (n == 0) { Serial.println("  No networks found"); return; }
-    Serial.printf("\n  %-32s %5s %4s %s\n", "SSID", "RSSI", "Ch", "Enc");
-    Serial.println("  " + String('-', 55));
-    for (int i = 0; i < n; i++) {
-        Serial.printf("  %-32s %3d dBm %3d  %s\n",
-            WiFi.SSID(i).c_str(),
-            WiFi.RSSI(i),
-            WiFi.channel(i),
-            (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Enc");
-    }
-    WiFi.scanDelete();
-    Serial.println();
-}
-
-void cmdWifiInfo() {
-    Serial.println(F("\n=== WiFi INFO ==="));
-    if (netMode == NET_STA_OK) {
-        Serial.printf("  Status   : Connected\n");
-        Serial.printf("  SSID     : %s\n", WiFi.SSID().c_str());
-        Serial.printf("  BSSID    : %s\n", WiFi.BSSIDstr().c_str());
-        Serial.printf("  IP       : %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("  Subnet   : %s\n", WiFi.subnetMask().toString().c_str());
-        Serial.printf("  Gateway  : %s\n", WiFi.gatewayIP().toString().c_str());
-        Serial.printf("  DNS      : %s\n", WiFi.dnsIP().toString().c_str());
-        Serial.printf("  RSSI     : %d dBm\n", WiFi.RSSI());
-        Serial.printf("  Channel  : %d\n", WiFi.channel());
-        Serial.printf("  MAC      : %s\n", WiFi.macAddress().c_str());
-        Serial.printf("  mDNS     : http://%s.local\n", MDNS_HOST);
-    } else if (netMode == NET_AP_MODE) {
-        Serial.printf("  Status   : AP mode\n");
-        Serial.printf("  SSID     : %s\n", AP_SSID);
-        Serial.printf("  IP       : %s\n", WiFi.softAPIP().toString().c_str());
-        Serial.printf("  Clients  : %d\n", WiFi.softAPgetStationNum());
-    } else {
-        Serial.println("  Status   : No network");
-    }
-    Serial.println();
-}
-
-void cmdSdInfo() {
-    Serial.println(F("\n=== SD CARD INFO ==="));
-    Serial.printf("  Available : %s\n", sdAvailable ? "YES" : "NO");
-    if (sdAvailable) {
-        uint8_t  t   = SD.cardType();
-        uint64_t sz  = SD.cardSize() / (1024 * 1024);
-        uint64_t tot = SD.totalBytes() / (1024 * 1024);
-        uint64_t used= SD.usedBytes()  / (1024 * 1024);
-        Serial.printf("  Type      : %s\n",
-            t == CARD_MMC ? "MMC" : t == CARD_SD ? "SDSC" :
-            t == CARD_SDHC ? "SDHC" : "UNKNOWN");
-        Serial.printf("  Card size : %lluMB\n", sz);
-        Serial.printf("  Total     : %lluMB\n", tot);
-        Serial.printf("  Used      : %lluMB\n", used);
-        Serial.printf("  Free      : %lluMB\n", tot - used);
-
-        File f = SD.open(LOG_FILENAME, FILE_READ);
-        if (f) {
-            Serial.printf("  Log file  : %s\n", LOG_FILENAME);
-            Serial.printf("  File size : %lu bytes\n", (unsigned long)f.size());
-            Serial.printf("  Est. rows : ~%lu\n", (unsigned long)(f.size() / 80));
-            f.close();
-        } else {
-            Serial.printf("  Log file  : Not found\n");
-        }
-    }
-    Serial.println();
-}
-
-void cmdMem() {
-    Serial.println(F("\n=== MEMORY REPORT ==="));
-    Serial.printf("  Free heap       : %lu bytes\n",  (unsigned long)ESP.getFreeHeap());
-    Serial.printf("  Min free heap   : %lu bytes\n",  (unsigned long)ESP.getMinFreeHeap());
-    Serial.printf("  Largest block   : %lu bytes\n",  (unsigned long)ESP.getMaxAllocHeap());
-    Serial.printf("  Total heap      : %lu bytes\n",  (unsigned long)ESP.getHeapSize());
-    Serial.printf("  Heap used       : %lu bytes\n",
-        (unsigned long)(ESP.getHeapSize() - ESP.getFreeHeap()));
-    Serial.printf("  PSRAM           : %s\n", psramFound() ? "Found" : "None");
-    if (psramFound()) {
-        Serial.printf("  Free PSRAM      : %lu bytes\n", (unsigned long)ESP.getFreePsram());
-        Serial.printf("  Total PSRAM     : %lu bytes\n", (unsigned long)ESP.getPsramSize());
-    }
-    Serial.printf("  Sketch size     : %lu bytes\n",  (unsigned long)ESP.getSketchSize());
-    Serial.printf("  Free sketch     : %lu bytes\n",  (unsigned long)ESP.getFreeSketchSpace());
-    Serial.printf("  Flash size      : %lu bytes\n",  (unsigned long)ESP.getFlashChipSize());
-    Serial.println();
-}
-
-// Process one complete command string
-void processCommand(const char* cmd) {
-    Serial.printf("\n> %s\n", cmd);
-
-    if      (strcmp(cmd, "help")     == 0) printHelp();
-    else if (strcmp(cmd, "status")   == 0) cmdStatus();
-    else if (strcmp(cmd, "sensor")   == 0) readSensor();
-    else if (strcmp(cmd, "buf")      == 0) cmdDumpBuffer();
-    else if (strcmp(cmd, "wifiscan") == 0) cmdWifiScan();
-    else if (strcmp(cmd, "wifiinfo") == 0) cmdWifiInfo();
-    else if (strcmp(cmd, "sdinfo")   == 0) cmdSdInfo();
-    else if (strcmp(cmd, "ntpresync")== 0) syncNTP();
-    else if (strcmp(cmd, "mem")      == 0) cmdMem();
-    else if (strcmp(cmd, "reboot")   == 0) {
-        LOG("[CMD] Rebooting...");
-        SD.end();
-        delay(200);
-        ESP.restart();
-    }
-    else if (strcmp(cmd, "reset")    == 0) {
-        bool ok = pzem.resetEnergy();
-        LOG("[CMD] Energy reset %s", ok ? "OK" : "FAILED");
-    }
-    else if (strcmp(cmd, "loglevel") == 0) {
-        verboseLog = !verboseLog;
-        LOG("[CMD] Verbose logging: %s", verboseLog ? "ON" : "OFF");
-    }
-    else {
-        Serial.printf("  Unknown command '%s' — type 'help'\n", cmd);
-    }
-}
-
-// Read bytes from Serial into cmdBuf, process on newline
-void handleSerial() {
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\r') continue;    // ignore CR
-        if (c == '\n' || c == '\0') {
-            if (cmdLen > 0) {
-                cmdBuf[cmdLen] = '\0';
-                processCommand(cmdBuf);
-                cmdLen = 0;
-            }
-        } else if (cmdLen < CMD_BUF_SIZE - 1) {
-            cmdBuf[cmdLen++] = c;
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -968,56 +707,28 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println(F("\n====== ESP32 Power Monitor ======"));
-    Serial.printf("  IDF version : %s\n", ESP.getSdkVersion());
-    Serial.printf("  CPU freq    : %u MHz\n", ESP.getCpuFreqMHz());
-    Serial.printf("  Flash size  : %lu bytes\n", (unsigned long)ESP.getFlashChipSize());
-    Serial.printf("  Free heap   : %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("  CPU freq  : %u MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("  Free heap : %lu bytes\n", (unsigned long)ESP.getFreeHeap());
     Serial.println(F("=================================\n"));
-
-    bootTime = millis();
 
     initWatchdog();
 
+#ifdef GENERIC_PZEM
+    Serial.println(F("[PZEM] GENERIC_PZEM — sensor bypassed, using simulated data"));
+#else
     Serial.println(F("[PZEM] Starting UART2 @ 9600 baud..."));
     Serial2.begin(9600, SERIAL_8N1, PZEM_RX_PIN, PZEM_TX_PIN);
-
-    // Flush anything buffered
     while (Serial2.available()) Serial2.read();
-
-    delay(100);
-
-    Serial.println("[TEST] Sending raw PZEM read command...");
-    // Address 0x01 read command with correct CRC
-    uint8_t cmd[] = {0x01, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x70, 0x0D};
-    Serial2.write(cmd, sizeof(cmd));
-
-    // Wait longer for response
-    delay(1000);
-
-    int avail = Serial2.available();
-    Serial.printf("[TEST] Bytes available: %d\n", avail);
-    if (avail > 0) {
-        Serial.print("[TEST] Raw bytes: ");
-        while (Serial2.available()) {
-            Serial.printf("0x%02X ", Serial2.read());
-        }
-        Serial.println();
-    } else {
-        Serial.println("[TEST] No response — PZEM not talking");
-    }
+#endif
 
     feedWatchdog();
-
     initSD();
     feedWatchdog();
-
     setupWiFi();
     feedWatchdog();
-
     startWebServer();
 
-    LOG("[INIT] Setup complete — type 'help' in Serial Monitor for debug commands");
-    LOG("[INFO] Dashboard: http://%s (no login required)",
+    LOG("[INIT] Ready — dashboard: http://%s",
         (netMode == NET_STA_OK) ? WiFi.localIP().toString().c_str()
                                 : WiFi.softAPIP().toString().c_str());
 }
@@ -1028,37 +739,26 @@ void setup() {
 
 void loop() {
     feedWatchdog();
-
-    // Handle serial debug commands
-    handleSerial();
-
     server.handleClient();
 
     uint32_t now = millis();
 
-    // Sensor read
     if (now - lastReadMs >= READ_INTERVAL_MS) {
         lastReadMs = now;
         readSensor();
         feedWatchdog();
     }
-
-    // SD log
     if (now - lastLogMs >= LOG_INTERVAL_MS) {
         lastLogMs = now;
         logToSD();
         feedWatchdog();
     }
-
-    // WiFi health check
     if (now - lastWifiMs >= WIFI_CHECK_MS) {
         lastWifiMs = now;
         checkWiFi();
         feedWatchdog();
     }
-
-    // Periodic NTP re-sync (catches boot-time failures)
-    if (netMode == NET_STA_OK && (now - lastNtpMs >= NTP_RESYNC_MS)) {
+    if (netMode == NET_STA_OK && now - lastNtpMs >= NTP_RESYNC_MS) {
         syncNTP();
         feedWatchdog();
     }
